@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 
-import multiprocessing
+""" Output a colorized list of listening addresses with owners.
+
+This tool parses the output of ``netstat`` directly to obtain the list
+of IPv4 and IPv6 addresses listening on tcp, tcp6, udp, and udp6 ports
+also with pids of processes responsible for the listening.
+
+The downside here is to obtain the full command name (netstat truncates
+at 20 characters), we need to call ``ps`` again for each pid we have,
+which is even more external commands.
+
+Must be run as root due to netstat needing root for pid to socket mappings.
+
+See ``net-listeners-proc.py`` for a much faster implementation because it
+parses /proc directly and doesn't need to call out to external proceses."""
+
 import subprocess
-import itertools
-import codecs
-import socket
-import struct
-import glob
 import re
-import os
 
-NETSTAT_LISTENING_TCP = "/bin/netstat --numeric-hosts --listening --program --tcp --inet --inet6"
-NETSTAT_LISTENING_UDP = "/bin/netstat --numeric-hosts --listening --program --udp --inet --inet6"
+NETSTAT_LISTENING = "/bin/netstat --numeric-hosts --listening --program --tcp --udp --inet --inet6"
 TERMINAL_WIDTH = "/usr/bin/tput cols"  # could also be "stty size"
-
-# oooh, look, a big dirty global dict collecting all our data without being passed
-# around! call the programming police!
-fds = {}
 
 
 class Color:
@@ -59,48 +62,50 @@ likelyLocalOnly = re.compile(NON_ROUTABLE_REGEX, re.VERBOSE)
 
 
 def run(thing):
-    """ run any string as a shell invocation """
+    """ Run any string as an async command invocation. """
     # We don't use subprocess.check_output because we want to run all
     # processes async
-    return subprocess.run(thing.split(), check=False, stdout=subprocess.PIPE)
+    return subprocess.Popen(thing.split(), stdout=subprocess.PIPE)
 
 
 def readOutput(ranCommand):
-    return ranCommand.stdout.decode('utf-8').strip().splitlines()
+    """ Return array of rows split by newline from previous invocation. """
+    stdout, stderr = ranCommand.communicate()
+    return stdout.decode('utf-8').strip().splitlines()
 
 
 def checkListenersSystemTools():
     # We intentionally don't check the output of these until after they
     # all run so they'll likely run in parallel without blocking.
-    tcp = run(NETSTAT_LISTENING_TCP)
-    udp = run(NETSTAT_LISTENING_UDP)
+    listening = run(NETSTAT_LISTENING)
     terminalWidth = run(TERMINAL_WIDTH)
 
-    tcp = readOutput(tcp)
-    udp = readOutput(udp)
+    listening = readOutput(listening)
 
-    cols = readOutput(terminalWidth)[0]
-    cols = int(cols)
+    try:
+        cols = readOutput(terminalWidth)[0]
+        cols = int(cols)
+    except BaseException:
+        cols = 80
 
     # Remove first two header lines
-    tcp = tcp[2:]
-    udp = udp[2:]
+    listening = listening[2:]
 
     # This is slightly ugly, but 'udp' has one column missing in the
     # middle so our pid indices don't line up.
     grandResult = []
-    for line in tcp:
+    for line in listening:
         parts = line.split()
-        proto = parts[0]
-        addr = parts[3]
-        pid = parts[6].split('/')[0]
-        grandResult.append([int(pid), addr, proto])
 
-    for line in udp:
-        parts = line.split()
+        # "udp" rows have one less column in the middle, so
+        # our pid offset is lower than "tcp" rows:
+        if parts[0].startswith("udp"):
+            pid = parts[5].split('/')[0]
+        else:
+            pid = parts[6].split('/')[0]
+
         proto = parts[0]
         addr = parts[3]
-        pid = parts[5].split('/')[0]
         grandResult.append([int(pid), addr, proto])
 
     # Build map of pids to names...
@@ -137,10 +142,10 @@ def checkListenersSystemTools():
         # throw up a color.
         # Note: due to port forwarding and NAT and other issues,
         #       this clearly isn't exhaustive.
-        if not re.match(likelyLocalOnly, addr):
-            colorNotice = COLOR_WARNING
-        else:
+        if re.match(likelyLocalOnly, addr):
             colorNotice = COLOR_OKAY
+        else:
+            colorNotice = COLOR_WARNING
 
         output = f"{colorNotice}{proto:5} {addr:25} {pid:5} {process}"
 
