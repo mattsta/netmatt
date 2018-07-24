@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 
-import multiprocessing
+""" Output a colorized list of listening addresses with owners.
+
+This tool parses files in /proc directly to obtain the list
+of IPv4 and IPv6 addresses listening on tcp, tcp6, udp, and udp6 ports
+also with pids of processes responsible for the listening.
+
+Due to permission restrictions on Linux, script must be run as root
+to determine which pids match which listening sockets.
+
+This is also something like:
+    osqueryi "select po.pid, rtrim(p.cmdline), po.family, po.local_address, po.local_port from process_open_sockets as po JOIN processes as p ON po.pid=p.pid WHERE po.state='LISTEN';"
+
+"""
+
 import subprocess
-import itertools
 import codecs
 import socket
 import struct
@@ -12,8 +24,8 @@ import os
 
 TERMINAL_WIDTH = "/usr/bin/tput cols"  # could also be "stty size"
 
-# oooh, look, a big dirty global dict collecting all our data without being passed
-# around! call the programming police!
+# oooh, look, a big dirty global dict collecting all our data without being
+# passed around! call the programming police!
 fds = {}
 
 
@@ -57,37 +69,63 @@ likelyLocalOnly = re.compile(NON_ROUTABLE_REGEX, re.VERBOSE)
 
 
 def run(thing):
-    """ run any string as a shell invocation """
+    """ Run any string as an async command invocation. """
     # We don't use subprocess.check_output because we want to run all
     # processes async
-    return subprocess.run(thing.split(), check=False, stdout=subprocess.PIPE)
+    return subprocess.Popen(thing.split(), stdout=subprocess.PIPE)
 
 
 def readOutput(ranCommand):
-    return ranCommand.stdout.decode('utf-8').strip().splitlines()
+    """ Return array of rows split by newline from previous invocation. """
+    stdout, stderr = ranCommand.communicate()
+    return stdout.decode('utf-8').strip().splitlines()
 
 
 def procListeners():
+    """ Wrapper to parse all IPv4 tcp udp, and, IPv6 tcp6 udp6 listeners. """
+
     def processProc(name):
+        """ Process IPv4 and IPv6 versions of listeners based on ``name``.
+
+        ``name`` is either 'udp' or 'tcp' so we parse, for each ``name``:
+            - /proc/net/[name]
+            - /proc/net/[name]6
+
+        As in:
+            - /proc/net/tcp
+            - /proc/net/tcp6
+            - /proc/net/udp
+            - /proc/net/udp6
+        """
+
         def ipv6(addr):
+            """ Convert /proc IPv6 hex address into standard IPv6 notation. """
+            # turn ASCII hex address into binary
             addr = codecs.decode(addr, "hex")
-            # big endian / network byte order, double 64-bit
-            addr = struct.unpack('>QQ', addr)
-            # native byte order, double 64-bit
-            addr = struct.pack('@QQ', *addr)
+
+            # unpack into 4 32-bit integers in big endian / network byte order
+            addr = struct.unpack('!LLLL', addr)
+
+            # re-pack as 4 32-bit integers in system native byte order
+            addr = struct.pack('@IIII', *addr)
+
+            # now we can use standard network APIs to format the address
             addr = socket.inet_ntop(socket.AF_INET6, addr)
             return addr
 
         def ipv4(addr):
-            # Instead of codecs.decode, we can just convert the 4 byte integer to hex directly
-            # using python radix conversion.
+            """ Convert /proc IPv4 hex address into standard IPv4 notation. """
+            # Instead of codecs.decode(), we can just convert a 4 byte hex
+            # string to an integer directly using python radix conversion.
             # Basically, int(addr, 16) EQUALS:
             # aOrig = addr
             # addr = codecs.decode(addr, "hex")
-            # addr = struct.unpack(">L", addr)  # little endian, 4-byte integer, one-element tuple
+            # addr = struct.unpack(">L", addr)
             # assert(addr == (int(aOrig, 16),))
             addr = int(addr, 16)
-            addr = struct.pack("<L", addr)  # little endian, 4-byte integer
+
+            # system native byte order, 4-byte integer
+            addr = struct.pack("=L", addr)
             addr = socket.inet_ntop(socket.AF_INET, addr)
             return addr
 
@@ -102,6 +140,8 @@ def procListeners():
 
                 for cxn in proto:
                     cxn = cxn.split()
+
+                    # /proc/net/udp{,6} uses different constants for LISTENING
                     if isUDP:
                         # These constants are based on enum offsets inside
                         # the Linux kernel itself. They aren't likely to ever
@@ -110,6 +150,8 @@ def procListeners():
                     else:
                         isListening = cxn[3] == "0A"
 
+                    # Right now this is a single-purpose tool so if fd is
+                    # not listening, we avoid further processing of this row.
                     if not isListening:
                         continue
 
@@ -120,54 +162,69 @@ def procListeners():
                         ip = ipv4(ip)
 
                     port = int(port, 16)
-                    try:
-                        port = socket.getservbyport(port)
-                    except BaseException:
-                        pass
-
                     fd = cxn[9]
 
-                    # Pad the fd with [] because the /proc/pid/fd/* entries are like:
-                    # socket:[fd]
-                    # so later we can just split on : and compare the second
-                    # half directly
-                    fds[f"[{fd}]"] = {
-                        'addr': ip, 'port': port, 'proto': f"{name}{ver}"}
+                    # We just use a list here because creating a new sub-dict
+                    # for each entry was noticably slower than just indexing
+                    # into lists.
+                    fds[int(fd)] = [ip, port, f"{name}{ver}"]
 
     processProc("tcp")
     processProc("udp")
 
 
-def processFd(fd):
+def discoverPIDAndCommandLineFromFDPath(fd):
+    """ Take a full path to /proc/[pid]/fd/[fd] for reading.
+
+    Populates both pid and full command line of pid owning a fd we
+    are interested in.
+
+    Basically finds if any fds on this pid is a listener we previously
+    recorded into our ``fds`` dict. """
     _, _, pid, _, _ = fd.split('/')
     try:
         target = os.readlink(fd)
-    except BaseException:
+    except FileNotFoundError:
         # file vanished, can't do anything else
         return
 
-    if ':' not in target:
-        return
+    if target.startswith("socket"):
+        ostype, osfd = target.split(':')
+        # strip brackets from fd string (it looks like: [fd])
+        osfd = int(osfd[1:-1])
 
-    ostype, osfd = target.split(':')
-
-    if osfd in fds:
-        fds[osfd]['pid'] = pid
-        try:
-            with open(f"/proc/{pid}/cmdline", 'r') as cmd:
-                fds[osfd]['cmd'] = cmd.read().split('\0')
-        except BaseException:
-            # files can vanish on us at any time and that's okay
-            # But, since the file is gone, we want the entire fd
-            # entry gone too:
-            del fds[osfd]
-            return
+        if osfd in fds:
+            fds[osfd].append(int(pid))
+            try:
+                with open(f"/proc/{pid}/cmdline", 'r') as cmd:
+                    # /proc command line arguments are delimited by
+                    # null bytes, so undo that here...
+                    fds[osfd].append(cmd.read().split('\0'))
+            except BaseException:
+                # files can vanish on us at any time (and that's okay!)
+                # But, since the file is gone, we want the entire fd
+                # entry gone too:
+                del fds[osfd]
 
 
 def addProcessNamesToFDs():
+    """ Loop over every fd in every process in /proc.
+
+    The only way to map an fd back to a process is by looking
+    at *every* processes fd and extracting matches.
+
+    It's basically like a big awkward database join where you don't
+    have an index on the field you want.
+
+    Also, due to Linux permissions (and Linux security concerns),
+    only the root user can read fd listing of processes not owned
+    by the current user. """
+
+    # glob glob glob it all
     allFDs = glob.iglob("/proc/*/fd/*")
+
     for fd in allFDs:
-        processFd(fd)
+        discoverPIDAndCommandLineFromFDPath(fd)
 
 
 def checkListenersProc():
@@ -177,8 +234,11 @@ def checkListenersProc():
     addProcessNamesToFDs()
     tried = fds
 
-    cols = readOutput(terminalWidth)[0]
-    cols = int(cols)
+    try:
+        cols = readOutput(terminalWidth)[0]
+        cols = int(cols)
+    except BaseException:
+        cols = 80
 
     # Print our own custom output header...
     proto = "Proto"
@@ -187,25 +247,56 @@ def checkListenersProc():
     process = "Process"
     print(f"{COLOR_HEADER}{proto:^5} {addr:^25} {pid:>5} {process:^30}")
 
-    def thing(what):
+    # Could sort by anything: ip, port, proto, pid, command name
+    # (or even the fd integer if that provided any insight whatsoever)
+    def compareByPidOrPort(what):
         k, v = what
-        return int(v['pid'])
+        # v = [ip, port, proto, pid, cmd]
+        # - OR -
+        # v = [ip, port, proto]
+
+        # If we're not running as root we can't pid and command mappings for
+        # the processes of other users, so sort the pids we did find at end
+        # of list and show UNKNOWN entries first
+        # (because the lines will be shorter most likely so the bigger visual
+        # weight should be lower in the display table)
+        try:
+            # Pid available! Sort by pid, subsort by IP then port.
+            return (1, v[3], v[0], v[1])
+        except BaseException:
+            # No pid available! Sort by port number then IP then... port again.
+            return (0, v[1], v[0], v[1])
 
     # Sort results by pid...
-    for name, vals in sorted(tried.items(), key=thing):
-        pid = vals['pid']
-        addr = f"{vals['addr']}:{vals['port']}"
-        proto = vals['proto']
-        process = ' '.join(vals['cmd'])
+    for name, vals in sorted(tried.items(), key=compareByPidOrPort):
+        try:
+            pid = vals[3]
+            process = ' '.join(vals[4])
+        except BaseException:
+            # If not running as root, we won't have pid or process, so use
+            # defaults
+            pid = "UNKNOWN"
+            process = '(must be root for global pid mappings)'
+
+        port = vals[1]
+        try:
+            # Convert port integer to service name if possible
+            port = socket.getservbyport(port)
+        except BaseException:
+            # If no match, just use port number directly.
+            pass
+
+        addr = f"{vals[0]}:{port}"
+        proto = vals[2]
 
         # If IP address looks like it could be visible to the world,
         # throw up a color.
         # Note: due to port forwarding and NAT and other issues,
         #       this clearly isn't exhaustive.
-        if not re.match(likelyLocalOnly, addr):
-            colorNotice = COLOR_WARNING
-        else:
+        if re.match(likelyLocalOnly, addr):
             colorNotice = COLOR_OKAY
+        else:
+            colorNotice = COLOR_WARNING
 
         output = f"{colorNotice}{proto:5} {addr:25} {pid:5} {process}"
 
