@@ -14,19 +14,23 @@ This is also something like:
 
 """
 
+import collections
 import subprocess
 import codecs
 import socket
 import struct
 import glob
+import sys
 import re
 import os
 
 TERMINAL_WIDTH = "/usr/bin/tput cols"  # could also be "stty size"
 
+ONLY_LOWEST_PID = False
+
 # oooh, look, a big dirty global dict collecting all our data without being
 # passed around! call the programming police!
-fds = {}
+inodes = {}
 
 
 class Color:
@@ -150,7 +154,7 @@ def procListeners():
                     else:
                         isListening = cxn[3] == "0A"
 
-                    # Right now this is a single-purpose tool so if fd is
+                    # Right now this is a single-purpose tool so if process is
                     # not listening, we avoid further processing of this row.
                     if not isListening:
                         continue
@@ -162,25 +166,25 @@ def procListeners():
                         ip = ipv4(ip)
 
                     port = int(port, 16)
-                    fd = cxn[9]
+                    inode = cxn[9]
 
                     # We just use a list here because creating a new sub-dict
                     # for each entry was noticably slower than just indexing
                     # into lists.
-                    fds[int(fd)] = [ip, port, f"{name}{ver}"]
+                    inodes[int(inode)] = [ip, port, f"{name}{ver}"]
 
     processProc("tcp")
     processProc("udp")
 
 
-def discoverPIDAndCommandLineFromFDPath(fd):
+def appendToInodePidMap(fd, inodePidMap):
     """ Take a full path to /proc/[pid]/fd/[fd] for reading.
 
-    Populates both pid and full command line of pid owning a fd we
+    Populates both pid and full command line of pid owning an inode we
     are interested in.
 
-    Basically finds if any fds on this pid is a listener we previously
-    recorded into our ``fds`` dict. """
+    Basically finds if any inodes on this pid is a listener we previously
+    recorded into our ``inodes`` dict. """
     _, _, pid, _, _ = fd.split('/')
     try:
         target = os.readlink(fd)
@@ -189,29 +193,17 @@ def discoverPIDAndCommandLineFromFDPath(fd):
         return
 
     if target.startswith("socket"):
-        ostype, osfd = target.split(':')
+        ostype, inode = target.split(':')
         # strip brackets from fd string (it looks like: [fd])
-        osfd = int(osfd[1:-1])
-
-        if osfd in fds:
-            fds[osfd].append(int(pid))
-            try:
-                with open(f"/proc/{pid}/cmdline", 'r') as cmd:
-                    # /proc command line arguments are delimited by
-                    # null bytes, so undo that here...
-                    fds[osfd].append(cmd.read().split('\0'))
-            except BaseException:
-                # files can vanish on us at any time (and that's okay!)
-                # But, since the file is gone, we want the entire fd
-                # entry gone too:
-                del fds[osfd]
+        inode = int(inode[1:-1])
+        inodePidMap[inode].append(int(pid))
 
 
-def addProcessNamesToFDs():
+def addProcessNamesToInodes():
     """ Loop over every fd in every process in /proc.
 
     The only way to map an fd back to a process is by looking
-    at *every* processes fd and extracting matches.
+    at *every* processes fd and extracting backing inodes.
 
     It's basically like a big awkward database join where you don't
     have an index on the field you want.
@@ -222,17 +214,33 @@ def addProcessNamesToFDs():
 
     # glob glob glob it all
     allFDs = glob.iglob("/proc/*/fd/*")
+    inodePidMap = collections.defaultdict(list)
 
     for fd in allFDs:
-        discoverPIDAndCommandLineFromFDPath(fd)
+        appendToInodePidMap(fd, inodePidMap)
+
+    for inode in inodes:
+        if inode in inodePidMap:
+            for pid in inodePidMap[inode]:
+                try:
+                    with open(f"/proc/{pid}/cmdline", 'r') as cmd:
+                        # /proc command line arguments are delimited by
+                        # null bytes, so undo that here...
+                        cmdline = cmd.read().split('\0')
+                        inodes[inode].append((pid, cmdline))
+                except BaseException:
+                    # files can vanish on us at any time (and that's okay!)
+                    # But, since the file is gone, we want the entire fd
+                    # entry gone too:
+                    pass  # del inodes[inode]
 
 
 def checkListenersProc():
     terminalWidth = run(TERMINAL_WIDTH)
 
     procListeners()
-    addProcessNamesToFDs()
-    tried = fds
+    addProcessNamesToInodes()
+    tried = inodes
 
     try:
         cols = readOutput(terminalWidth)[0]
@@ -261,7 +269,7 @@ def checkListenersProc():
         # (because the lines will be shorter most likely so the bigger visual
         # weight should be lower in the display table)
         try:
-            # Pid available! Sort by pid, subsort by IP then port.
+            # Pid available! Sort by first pid, subsort by IP then port.
             return (1, v[3], v[0], v[1])
         except BaseException:
             # No pid available! Sort by port number then IP then... port again.
@@ -269,14 +277,13 @@ def checkListenersProc():
 
     # Sort results by pid...
     for name, vals in sorted(tried.items(), key=compareByPidOrPort):
-        try:
-            pid = vals[3]
-            process = ' '.join(vals[4])
-        except BaseException:
+        attachedPids = vals[3:]
+        if attachedPids:
+            desc = [f"{pid:5} {' '.join(cmd)}" for pid, cmd in vals[3:]]
+        else:
             # If not running as root, we won't have pid or process, so use
             # defaults
-            pid = "UNKNOWN"
-            process = '(must be root for global pid mappings)'
+            desc = ["UNKNOWN (must be root for global pid mappings)"]
 
         port = vals[1]
         try:
@@ -298,14 +305,30 @@ def checkListenersProc():
         else:
             colorNotice = COLOR_WARNING
 
-        output = f"{colorNotice}{proto:5} {addr:25} {pid:5} {process}"
+        isFirstLine = True
+        for line in desc:
+            if isFirstLine:
+                output = f"{colorNotice}{proto:5} {addr:25} {line}"
+                isFirstLine = False
+            else:
+                output = f"{' ':31} {line}"
 
-        # Be a polite terminal citizen by limiting our width to user's width
-        # (colors take up non-visible space, so add it to our col count)
-        print(output[:cols + len(colorNotice)])
+            # Be a polite terminal citizen by limiting our width to user's width
+            # (colors take up non-visible space, so add it to our col count)
+            print(output[:cols + (len(colorNotice) if isFirstLine else 0)])
+
+            if ONLY_LOWEST_PID:
+                break
 
     print(COLOR_END)
 
 
 if __name__ == "__main__":
+    # cheap hack garbage way of setting one option
+    # if we need more options, obviously pull in argparse
+    if len(sys.argv) > 1:
+        ONLY_LOWEST_PID = True
+    else:
+        ONLY_LOWEST_PID = False
+
     checkListenersProc()
